@@ -41,6 +41,10 @@ class RetargetingConfig:
     # DexPilot retargeting link names
     finger_tip_link_names: Optional[List[str]] = None
 
+    # Optional DexPilot extensions. If a section is omitted, the feature is disabled.
+    pointing_task: Optional[Dict[str, Any]] = None
+    grasp_prior: Optional[Dict[str, Any]] = None
+
     # Scaling factor for vector retargeting only
     # For example, Allegro is 1.6 times larger than normal human hand, then this scaling factor should be 1.6
     scaling_factor: float = 1.0
@@ -115,6 +119,14 @@ class RetargetingConfig:
                 raise ValueError(
                     "Position retargeting requires: finger_tip_link_names + wrist_link_name"
                 )
+            self.pointing_task = self._normalize_optional_section(
+                self.pointing_task, "pointing_task"
+            )
+            self.grasp_prior = self._normalize_optional_section(
+                self.grasp_prior, "grasp_prior"
+            )
+            self._validate_pointing_task()
+            self._validate_grasp_prior()
             if self.target_link_human_indices is not None:
                 print(
                     "\033[33m",
@@ -131,6 +143,65 @@ class RetargetingConfig:
         if not urdf_path.exists():
             raise ValueError(f"URDF path {urdf_path} does not exist")
         self.urdf_path = str(urdf_path)
+
+    @staticmethod
+    def _normalize_optional_section(
+        section: Optional[Dict[str, Any]], name: str
+    ) -> Optional[Dict[str, Any]]:
+        if section is None:
+            return None
+        if not isinstance(section, dict):
+            raise ValueError(f"DexPilot {name} must be a mapping if provided")
+        return dict(section)
+
+    def _validate_pointing_task(self):
+        if self.pointing_task is None:
+            return
+        axes = self.pointing_task.get("finger_tip_link_axes")
+        dip_indices = self.pointing_task.get("human_dip_indices")
+        weight = float(self.pointing_task.get("weight", 0.0))
+        if axes is None or dip_indices is None:
+            raise ValueError(
+                "DexPilot pointing_task requires finger_tip_link_axes and human_dip_indices"
+            )
+        if len(axes) != len(self.finger_tip_link_names):
+            raise ValueError(
+                "DexPilot pointing_task finger_tip_link_axes dim mismatch with finger_tip_link_names"
+            )
+        if len(dip_indices) != len(self.finger_tip_link_names):
+            raise ValueError(
+                "DexPilot pointing_task human_dip_indices dim mismatch with finger_tip_link_names"
+            )
+        if weight <= 0.0:
+            self.pointing_task = None
+
+    def _validate_grasp_prior(self):
+        if self.grasp_prior is None:
+            return
+        ref_indices = self.grasp_prior.get("human_reference_indices")
+        joint_names = self.grasp_prior.get("joint_names")
+        joint_targets = self.grasp_prior.get("joint_targets")
+        weight = float(self.grasp_prior.get("weight", 0.0))
+        dist_min = float(self.grasp_prior.get("distance_min", 0.055))
+        dist_max = float(self.grasp_prior.get("distance_max", 0.095))
+        if ref_indices is None or joint_names is None or joint_targets is None:
+            raise ValueError(
+                "DexPilot grasp_prior requires human_reference_indices, joint_names and joint_targets"
+            )
+        if len(ref_indices) != len(self.finger_tip_link_names) - 1:
+            raise ValueError(
+                "DexPilot grasp_prior human_reference_indices dim mismatch with non-thumb finger count"
+            )
+        if len(joint_names) != len(joint_targets):
+            raise ValueError(
+                "DexPilot grasp_prior joint_names and joint_targets dim mismatch"
+            )
+        if dist_max <= dist_min:
+            raise ValueError(
+                "DexPilot grasp_prior requires distance_max > distance_min"
+            )
+        if weight <= 0.0:
+            self.grasp_prior = None
 
     @classmethod
     def set_default_urdf_dir(cls, urdf_dir: Union[str, Path]):
@@ -154,6 +225,7 @@ class RetargetingConfig:
 
     @classmethod
     def from_dict(cls, cfg: Dict[str, Any], override: Optional[Dict] = None):
+        cfg = dict(cfg)
         if "target_link_human_indices" in cfg:
             cfg["target_link_human_indices"] = np.array(
                 cfg["target_link_human_indices"]
@@ -216,11 +288,22 @@ class RetargetingConfig:
                 huber_delta=self.huber_delta,
             )
         elif self.type == "dexpilot":
+            pointing_task = self.pointing_task or {}
+            grasp_prior = self.grasp_prior or {}
             optimizer = DexPilotOptimizer(
                 robot,
                 joint_names,
                 finger_tip_link_names=self.finger_tip_link_names,
                 wrist_link_name=self.wrist_link_name,
+                finger_tip_link_axes=pointing_task.get("finger_tip_link_axes"),
+                human_dip_indices=pointing_task.get("human_dip_indices"),
+                fingertip_direction_weight=float(pointing_task.get("weight", 0.0)),
+                human_grasp_reference_indices=grasp_prior.get("human_reference_indices"),
+                grasp_joint_names=grasp_prior.get("joint_names"),
+                grasp_joint_targets=grasp_prior.get("joint_targets"),
+                grasp_distance_min=float(grasp_prior.get("distance_min", 0.055)),
+                grasp_distance_max=float(grasp_prior.get("distance_max", 0.095)),
+                grasp_prior_weight=float(grasp_prior.get("weight", 0.0)),
                 target_link_human_indices=self.target_link_human_indices,
                 scaling=self.scaling_factor,
                 project_dist=self.project_dist,

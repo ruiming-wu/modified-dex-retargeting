@@ -12,6 +12,34 @@ from dex_retargeting.kinematics_adaptor import (
 from dex_retargeting.robot_wrapper import RobotWrapper
 
 
+def _axis_name_to_vector(axis_name: str) -> np.ndarray:
+    mapping = {
+        "+x": np.array([1.0, 0.0, 0.0], dtype=np.float32),
+        "-x": np.array([-1.0, 0.0, 0.0], dtype=np.float32),
+        "+y": np.array([0.0, 1.0, 0.0], dtype=np.float32),
+        "-y": np.array([0.0, -1.0, 0.0], dtype=np.float32),
+        "+z": np.array([0.0, 0.0, 1.0], dtype=np.float32),
+        "-z": np.array([0.0, 0.0, -1.0], dtype=np.float32),
+    }
+    key = axis_name.strip().lower()
+    if key not in mapping:
+        raise ValueError(
+            f"Unsupported fingertip axis {axis_name!r}. Expected one of {list(mapping.keys())}"
+        )
+    return mapping[key]
+
+
+def _skew(v: np.ndarray) -> np.ndarray:
+    return np.array(
+        [
+            [0.0, -v[2], v[1]],
+            [v[2], 0.0, -v[0]],
+            [-v[1], v[0], 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+
 class Optimizer:
     retargeting_type = "BASE"
 
@@ -195,7 +223,7 @@ class PositionOptimizer(Optimizer):
 
                 grad[:] = grad_qpos[:]
 
-            return result
+            return float(result)
 
         return objective
 
@@ -301,7 +329,7 @@ class VectorOptimizer(Optimizer):
 
                 grad[:] = grad_qpos[:]
 
-            return result
+            return float(result)
 
         return objective
 
@@ -336,6 +364,15 @@ class DexPilotOptimizer(Optimizer):
         target_joint_names: List[str],
         finger_tip_link_names: List[str],
         wrist_link_name: str,
+        finger_tip_link_axes: Optional[List[str]] = None,
+        human_dip_indices: Optional[List[int]] = None,
+        fingertip_direction_weight: float = 0.0,
+        human_grasp_reference_indices: Optional[List[int]] = None,
+        grasp_joint_names: Optional[List[str]] = None,
+        grasp_joint_targets: Optional[List[float]] = None,
+        grasp_distance_min: float = 0.025,
+        grasp_distance_max: float = 0.075,
+        grasp_prior_weight: float = 0.0,
         target_link_human_indices: Optional[np.ndarray] = None,
         huber_delta=0.03,
         norm_delta=4e-3,
@@ -357,6 +394,8 @@ class DexPilotOptimizer(Optimizer):
         origin_link_index, task_link_index = self.generate_link_indices(
             self.num_fingers
         )
+        self.dexpilot_origin_link_index = np.asarray(origin_link_index, dtype=int)
+        self.dexpilot_task_link_index = np.asarray(task_link_index, dtype=int)
 
         if target_link_human_indices is None:
             target_link_human_indices = (
@@ -372,6 +411,21 @@ class DexPilotOptimizer(Optimizer):
         self.scaling = scaling
         self.huber_loss = torch.nn.SmoothL1Loss(beta=huber_delta, reduction="none")
         self.norm_delta = norm_delta
+        self.finger_tip_link_names = finger_tip_link_names
+        self.wrist_link_name = wrist_link_name
+        self.finger_tip_link_axes = finger_tip_link_axes
+        self.human_dip_indices = human_dip_indices
+        self.fingertip_direction_weight = float(fingertip_direction_weight)
+        self.human_grasp_reference_indices = human_grasp_reference_indices
+        self.grasp_joint_names = grasp_joint_names
+        self.grasp_joint_targets = (
+            np.asarray(grasp_joint_targets, dtype=np.float32)
+            if grasp_joint_targets is not None
+            else None
+        )
+        self.grasp_distance_min = float(grasp_distance_min)
+        self.grasp_distance_max = float(grasp_distance_max)
+        self.grasp_prior_weight = float(grasp_prior_weight)
 
         # DexPilot parameters
         self.project_dist = project_dist
@@ -390,6 +444,45 @@ class DexPilotOptimizer(Optimizer):
         self.task_link_indices = torch.tensor(
             [self.computed_link_names.index(name) for name in target_task_link_names]
         )
+        self.wrist_computed_index = self.computed_link_names.index(wrist_link_name)
+        self.finger_tip_computed_indices = [
+            self.computed_link_names.index(name) for name in finger_tip_link_names
+        ]
+        self.finger_tip_link_indices = self.get_link_indices(finger_tip_link_names)
+        if self.finger_tip_link_axes is not None:
+            if len(self.finger_tip_link_axes) != self.num_fingers:
+                raise ValueError(
+                    "finger_tip_link_axes length must match number of fingers"
+                )
+            self.finger_tip_axis_local = np.stack(
+                [_axis_name_to_vector(name) for name in self.finger_tip_link_axes],
+                axis=0,
+            )
+        else:
+            self.finger_tip_axis_local = None
+        if self.grasp_prior_weight > 0.0:
+            if self.human_grasp_reference_indices is None:
+                raise ValueError(
+                    "DexPilot grasp prior requires human_grasp_reference_indices in config."
+                )
+            if self.grasp_joint_names is None or self.grasp_joint_targets is None:
+                raise ValueError(
+                    "DexPilot grasp prior requires grasp_joint_names and grasp_joint_targets in config."
+                )
+            if len(self.human_grasp_reference_indices) != self.num_fingers - 1:
+                raise ValueError(
+                    "DexPilot grasp prior expects one human reference point per non-thumb finger."
+                )
+            self.grasp_joint_indices = np.array(
+                [self.target_joint_names.index(name) for name in self.grasp_joint_names],
+                dtype=int,
+            )
+            if self.grasp_distance_max <= self.grasp_distance_min:
+                raise ValueError(
+                    "DexPilot grasp prior requires grasp_distance_max > grasp_distance_min."
+                )
+        else:
+            self.grasp_joint_indices = None
 
         # Sanity check and cache link indices
         self.computed_link_indices = self.get_link_indices(self.computed_link_names)
@@ -453,6 +546,19 @@ class DexPilotOptimizer(Optimizer):
 
         return projected, s2_project_index_origin, s2_project_index_task, projected_dist
 
+    @staticmethod
+    def _compute_soft_activation(
+        distance: np.ndarray, full_activation_dist: float, zero_activation_dist: float
+    ) -> np.ndarray:
+        if zero_activation_dist <= full_activation_dist:
+            raise ValueError(
+                "DexPilot soft pinch activation requires zero_activation_dist > full_activation_dist."
+            )
+        activation = (zero_activation_dist - distance) / (
+            zero_activation_dist - full_activation_dist
+        )
+        return np.clip(activation.astype(np.float32), 0.0, 1.0)
+
     def get_objective_function(
         self, target_vector: np.ndarray, fixed_qpos: np.ndarray, last_qpos: np.ndarray
     ):
@@ -463,22 +569,79 @@ class DexPilotOptimizer(Optimizer):
         len_s2 = len(self.s2_project_index_task)
         len_s1 = len_proj - len_s2
 
-        # Update projection indicator
         target_vec_dist = np.linalg.norm(target_vector[:len_proj], axis=1)
-        self.projected[:len_s1][target_vec_dist[0:len_s1] < self.project_dist] = True
-        self.projected[:len_s1][target_vec_dist[0:len_s1] > self.escape_dist] = False
-        self.projected[len_s1:len_proj] = np.logical_and(
-            self.projected[:len_s1][self.s2_project_index_origin],
-            self.projected[:len_s1][self.s2_project_index_task],
+        kinematic_target_vector = target_vector[: len_proj + self.num_fingers]
+
+        direction_target = None
+        grasp_reference_points = None
+        raw_distance_tips = None
+        raw_grasp_reference_points = None
+        expected_tail_terms = 0
+        if self.fingertip_direction_weight > 0.0:
+            if self.human_dip_indices is None or self.finger_tip_axis_local is None:
+                raise ValueError(
+                    "DexPilot fingertip direction loss requires both human_dip_indices "
+                    "and finger_tip_link_axes in config."
+                )
+            expected_tail_terms += self.num_fingers
+        if self.grasp_prior_weight > 0.0:
+            expected_tail_terms += self.num_fingers - 1
+        expected_shape = (len_proj + self.num_fingers + expected_tail_terms, 3)
+        expected_shape_with_raw_dist = (
+            len_proj
+            + self.num_fingers
+            + expected_tail_terms
+            + self.num_fingers
+            + (self.num_fingers - 1 if self.grasp_prior_weight > 0.0 else 0),
+            3,
         )
-        self.projected[len_s1:len_proj] = np.logical_and(
-            self.projected[len_s1:len_proj], target_vec_dist[len_s1:len_proj] <= 0.03
+        if target_vector.shape not in (expected_shape, expected_shape_with_raw_dist):
+            raise ValueError(
+                f"DexPilot target_vector expects shape {expected_shape} or {expected_shape_with_raw_dist}, got {target_vector.shape}"
+            )
+        tail_start = len_proj + self.num_fingers
+        if self.fingertip_direction_weight > 0.0:
+            direction_target = target_vector[tail_start : tail_start + self.num_fingers]
+            direction_target = direction_target / (
+                np.linalg.norm(direction_target, axis=1, keepdims=True) + 1e-6
+            )
+            tail_start += self.num_fingers
+        if self.grasp_prior_weight > 0.0:
+            grasp_reference_points = target_vector[tail_start : tail_start + self.num_fingers - 1]
+            tail_start += self.num_fingers - 1
+        if target_vector.shape == expected_shape_with_raw_dist:
+            raw_distance_tips = target_vector[tail_start : tail_start + self.num_fingers]
+            tail_start += self.num_fingers
+            if self.grasp_prior_weight > 0.0:
+                raw_grasp_reference_points = target_vector[
+                    tail_start : tail_start + self.num_fingers - 1
+                ]
+
+        pinch_target_vec_dist = target_vec_dist
+        if raw_distance_tips is not None:
+            pair_origin = self.dexpilot_origin_link_index[:len_proj] - 1
+            pair_task = self.dexpilot_task_link_index[:len_proj] - 1
+            raw_pair_vec = raw_distance_tips[pair_task] - raw_distance_tips[pair_origin]
+            pinch_target_vec_dist = np.linalg.norm(raw_pair_vec, axis=1)
+
+        pinch_activation_s1 = self._compute_soft_activation(
+            pinch_target_vec_dist[0:len_s1], self.project_dist, self.escape_dist
         )
+        pinch_activation_s2 = (
+            pinch_activation_s1[self.s2_project_index_origin]
+            * pinch_activation_s1[self.s2_project_index_task]
+        )
+        pinch_activation_s2 *= self._compute_soft_activation(
+            pinch_target_vec_dist[len_s1:len_proj], self.project_dist, self.escape_dist
+        )
+        pinch_activation = np.concatenate(
+            [pinch_activation_s1, pinch_activation_s2], axis=0
+        ).astype(np.float32)
 
         # Update weight vector
         normal_weight = np.ones(len_proj, dtype=np.float32) * 1
         high_weight = np.array([200] * len_s1 + [400] * len_s2, dtype=np.float32)
-        weight = np.where(self.projected, high_weight, normal_weight)
+        weight = normal_weight + pinch_activation * (high_weight - normal_weight)
 
         # We change the weight to 10 instead of 1 here, for vector originate from wrist to fingertips
         # This ensures better intuitive mapping due wrong pose detection
@@ -493,17 +656,17 @@ class DexPilotOptimizer(Optimizer):
         )
 
         # Compute reference distance vector
-        normal_vec = target_vector * self.scaling  # (10, 3)
-        dir_vec = target_vector[:len_proj] / (target_vec_dist[:, None] + 1e-6)  # (6, 3)
-        projected_vec = dir_vec * self.projected_dist[:, None]  # (6, 3)
+        normal_vec = kinematic_target_vector * self.scaling
+        dir_vec = target_vector[:len_proj] / (target_vec_dist[:, None] + 1e-6)
+        projected_vec = dir_vec * self.projected_dist[:, None]
 
-        # Compute final reference vector
-        reference_vec = np.where(
-            self.projected[:, None], projected_vec, normal_vec[:len_proj]
-        )  # (6, 3)
+        # Compute final reference vector with the same continuous pinch activation.
+        reference_vec = normal_vec[:len_proj] + pinch_activation[:, None] * (
+            projected_vec - normal_vec[:len_proj]
+        )
         reference_vec = np.concatenate(
             [reference_vec, normal_vec[len_proj:]], axis=0
-        )  # (10, 3)
+        )
         torch_target_vec = torch.as_tensor(reference_vec, dtype=torch.float32)
         torch_target_vec.requires_grad_(False)
 
@@ -540,6 +703,87 @@ class DexPilotOptimizer(Optimizer):
             huber_distance = huber_distance.sum()
             result = huber_distance.cpu().detach().item()
 
+            orientation_grad_qpos = None
+            if direction_target is not None:
+                wrist_pose = target_link_poses[self.wrist_computed_index]
+                wrist_rot = wrist_pose[:3, :3]
+                wrist_local_target = direction_target.astype(np.float32)
+                orientation_loss = 0.0
+                if grad.size > 0:
+                    orientation_grad_qpos = np.zeros(self.opt_dof, dtype=np.float32)
+                for finger_id, tip_idx in enumerate(self.finger_tip_computed_indices):
+                    tip_pose = target_link_poses[tip_idx]
+                    tip_rot = tip_pose[:3, :3]
+                    axis_world = tip_rot @ self.finger_tip_axis_local[finger_id]
+                    axis_wrist = wrist_rot.T @ axis_world
+                    axis_wrist = axis_wrist / (np.linalg.norm(axis_wrist) + 1e-6)
+                    target_axis = wrist_local_target[finger_id]
+                    cos_sim = float(np.clip(np.dot(axis_wrist, target_axis), -1.0, 1.0))
+                    orientation_loss += (1.0 - cos_sim) * self.fingertip_direction_weight / self.num_fingers
+
+                    if grad.size > 0:
+                        tip_link_index = self.finger_tip_link_indices[finger_id]
+                        tip_body_jacobian = self.robot.compute_single_link_local_jacobian(
+                            qpos, tip_link_index
+                        )[3:, ...]
+                        wrist_link_jacobian = self.robot.compute_single_link_local_jacobian(
+                            qpos, self.computed_link_indices[self.wrist_computed_index]
+                        )[3:, ...]
+                        tip_angular_world = tip_rot @ tip_body_jacobian
+                        wrist_angular_world = wrist_rot @ wrist_link_jacobian
+                        relative_angular_wrist = wrist_rot.T @ (
+                            tip_angular_world - wrist_angular_world
+                        )
+                        axis_jacobian = -_skew(axis_wrist) @ relative_angular_wrist
+                        if self.adaptor is not None:
+                            axis_jacobian = self.adaptor.backward_jacobian(
+                                axis_jacobian[None, ...]
+                            )[0]
+                        else:
+                            axis_jacobian = axis_jacobian[..., self.idx_pin2target]
+                        orientation_grad_qpos += (
+                            -(target_axis @ axis_jacobian)
+                            * self.fingertip_direction_weight
+                            / self.num_fingers
+                        ).astype(np.float32)
+                result += orientation_loss
+
+            grasp_grad_qpos = None
+            if grasp_reference_points is not None:
+                if raw_distance_tips is not None and raw_grasp_reference_points is not None:
+                    grasp_dists = np.linalg.norm(
+                        raw_distance_tips[1:] - raw_grasp_reference_points,
+                        axis=1,
+                    )
+                else:
+                    human_non_thumb_tips = target_vector[
+                        len_proj + 1 : len_proj + self.num_fingers
+                    ]
+                    grasp_dists = np.linalg.norm(
+                        human_non_thumb_tips - grasp_reference_points,
+                        axis=1,
+                    )
+                grasp_activation = np.clip(
+                    (self.grasp_distance_max - grasp_dists)
+                    / (self.grasp_distance_max - self.grasp_distance_min + 1e-6),
+                    0.0,
+                    1.0,
+                ).mean()
+                grasp_weight = grasp_activation * max(
+                    0.0, self.grasp_prior_weight
+                )
+                grasp_delta = x[self.grasp_joint_indices] - self.grasp_joint_targets
+                grasp_loss = grasp_weight * float(np.mean(grasp_delta ** 2))
+                result += grasp_loss
+                if grad.size > 0:
+                    grasp_grad_qpos = np.zeros(self.opt_dof, dtype=np.float32)
+                    grasp_grad_qpos[self.grasp_joint_indices] = (
+                        2.0
+                        * grasp_weight
+                        * grasp_delta
+                        / max(1, len(self.grasp_joint_indices))
+                    ).astype(np.float32)
+
             if grad.size > 0:
                 jacobians = []
                 for i, index in enumerate(self.computed_link_indices):
@@ -569,9 +813,13 @@ class DexPilotOptimizer(Optimizer):
                 # which is equivalent to fully opened the hand
                 # In our implementation, we regularize the joint angles to the previous joint angles
                 grad_qpos += 2 * self.norm_delta * (x - last_qpos)
+                if orientation_grad_qpos is not None:
+                    grad_qpos += orientation_grad_qpos
+                if grasp_grad_qpos is not None:
+                    grad_qpos += grasp_grad_qpos
 
                 grad[:] = grad_qpos[:]
 
-            return result
+            return float(result)
 
         return objective
