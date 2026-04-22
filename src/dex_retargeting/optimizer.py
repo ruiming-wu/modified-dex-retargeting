@@ -254,10 +254,6 @@ class VectorOptimizer(Optimizer):
         self.computed_link_names = list(
             set(target_origin_link_names).union(set(target_task_link_names))
         )
-        if self.pointing_link_names is not None:
-            self.computed_link_names = list(
-                set(self.computed_link_names).union(set(self.pointing_link_names))
-            )
         self.origin_link_indices = torch.tensor(
             [self.computed_link_names.index(name) for name in target_origin_link_names]
         )
