@@ -459,10 +459,7 @@ class DexPilotOptimizer(Optimizer):
             self.computed_link_names.index(name) for name in finger_tip_link_names
         ]
         if self.pointing_link_names is not None:
-            if (
-                self.pointing_link_axes is None
-                or self.pointing_human_indices is None
-            ):
+            if self.pointing_link_axes is None or self.pointing_human_indices is None:
                 raise ValueError(
                     "DexPilot pointing_task requires pointing_link_names, pointing_link_axes and pointing_human_indices."
                 )
@@ -476,7 +473,8 @@ class DexPilotOptimizer(Optimizer):
                 )
             self.pointing_link_indices = self.get_link_indices(self.pointing_link_names)
             self.pointing_link_computed_indices = [
-                self.computed_link_names.index(name) for name in self.pointing_link_names
+                self.computed_link_names.index(name)
+                for name in self.pointing_link_names
             ]
             self.pointing_axis_local = np.stack(
                 [_axis_name_to_vector(name) for name in self.pointing_link_axes],
@@ -503,7 +501,10 @@ class DexPilotOptimizer(Optimizer):
                     "DexPilot grasp prior expects one human reference point per non-thumb finger."
                 )
             self.grasp_joint_indices = np.array(
-                [self.target_joint_names.index(name) for name in self.grasp_joint_names],
+                [
+                    self.target_joint_names.index(name)
+                    for name in self.grasp_joint_names
+                ],
                 dtype=int,
             )
             if self.grasp_distance_max <= self.grasp_distance_min:
@@ -637,10 +638,14 @@ class DexPilotOptimizer(Optimizer):
             )
             tail_start += len(self.pointing_link_names)
         if self.grasp_prior_weight > 0.0:
-            grasp_reference_points = target_vector[tail_start : tail_start + self.num_fingers - 1]
+            grasp_reference_points = target_vector[
+                tail_start : tail_start + self.num_fingers - 1
+            ]
             tail_start += self.num_fingers - 1
         if target_vector.shape == expected_shape_with_raw_dist:
-            raw_distance_tips = target_vector[tail_start : tail_start + self.num_fingers]
+            raw_distance_tips = target_vector[
+                tail_start : tail_start + self.num_fingers
+            ]
             tail_start += self.num_fingers
             if self.grasp_prior_weight > 0.0:
                 raw_grasp_reference_points = target_vector[
@@ -694,9 +699,7 @@ class DexPilotOptimizer(Optimizer):
         reference_vec = normal_vec[:len_proj] + pinch_activation[:, None] * (
             projected_vec - normal_vec[:len_proj]
         )
-        reference_vec = np.concatenate(
-            [reference_vec, normal_vec[len_proj:]], axis=0
-        )
+        reference_vec = np.concatenate([reference_vec, normal_vec[len_proj:]], axis=0)
         torch_target_vec = torch.as_tensor(reference_vec, dtype=torch.float32)
         torch_target_vec.requires_grad_(False)
 
@@ -758,12 +761,17 @@ class DexPilotOptimizer(Optimizer):
 
                     if grad.size > 0:
                         tip_link_index = self.pointing_link_indices[task_id]
-                        tip_body_jacobian = self.robot.compute_single_link_local_jacobian(
-                            qpos, tip_link_index
-                        )[3:, ...]
-                        wrist_link_jacobian = self.robot.compute_single_link_local_jacobian(
-                            qpos, self.computed_link_indices[self.wrist_computed_index]
-                        )[3:, ...]
+                        tip_body_jacobian = (
+                            self.robot.compute_single_link_local_jacobian(
+                                qpos, tip_link_index
+                            )[3:, ...]
+                        )
+                        wrist_link_jacobian = (
+                            self.robot.compute_single_link_local_jacobian(
+                                qpos,
+                                self.computed_link_indices[self.wrist_computed_index],
+                            )[3:, ...]
+                        )
                         tip_angular_world = tip_rot @ tip_body_jacobian
                         wrist_angular_world = wrist_rot @ wrist_link_jacobian
                         relative_angular_wrist = wrist_rot.T @ (
@@ -785,7 +793,10 @@ class DexPilotOptimizer(Optimizer):
 
             grasp_grad_qpos = None
             if grasp_reference_points is not None:
-                if raw_distance_tips is not None and raw_grasp_reference_points is not None:
+                if (
+                    raw_distance_tips is not None
+                    and raw_grasp_reference_points is not None
+                ):
                     grasp_dists = np.linalg.norm(
                         raw_distance_tips[1:] - raw_grasp_reference_points,
                         axis=1,
@@ -804,11 +815,9 @@ class DexPilotOptimizer(Optimizer):
                     0.0,
                     1.0,
                 ).mean()
-                grasp_weight = grasp_activation * max(
-                    0.0, self.grasp_prior_weight
-                )
+                grasp_weight = grasp_activation * max(0.0, self.grasp_prior_weight)
                 grasp_delta = x[self.grasp_joint_indices] - self.grasp_joint_targets
-                grasp_loss = grasp_weight * float(np.mean(grasp_delta ** 2))
+                grasp_loss = grasp_weight * float(np.mean(grasp_delta**2))
                 result += grasp_loss
                 if grad.size > 0:
                     grasp_grad_qpos = np.zeros(self.opt_dof, dtype=np.float32)

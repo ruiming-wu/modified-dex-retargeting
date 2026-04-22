@@ -305,7 +305,9 @@ class RetargetingConfig:
                 pointing_link_axes=pointing_task.get("link_axes"),
                 pointing_human_indices=pointing_task.get("human_indices"),
                 fingertip_direction_weight=float(pointing_task.get("weight", 0.0)),
-                human_grasp_reference_indices=grasp_prior.get("human_reference_indices"),
+                human_grasp_reference_indices=grasp_prior.get(
+                    "human_reference_indices"
+                ),
                 grasp_joint_names=grasp_prior.get("joint_names"),
                 grasp_joint_targets=grasp_prior.get("joint_targets"),
                 grasp_distance_min=float(grasp_prior.get("distance_min", 0.055)),
