@@ -254,6 +254,10 @@ class VectorOptimizer(Optimizer):
         self.computed_link_names = list(
             set(target_origin_link_names).union(set(target_task_link_names))
         )
+        if self.pointing_link_names is not None:
+            self.computed_link_names = list(
+                set(self.computed_link_names).union(set(self.pointing_link_names))
+            )
         self.origin_link_indices = torch.tensor(
             [self.computed_link_names.index(name) for name in target_origin_link_names]
         )
@@ -364,8 +368,9 @@ class DexPilotOptimizer(Optimizer):
         target_joint_names: List[str],
         finger_tip_link_names: List[str],
         wrist_link_name: str,
-        finger_tip_link_axes: Optional[List[str]] = None,
-        human_dip_indices: Optional[List[int]] = None,
+        pointing_link_names: Optional[List[str]] = None,
+        pointing_link_axes: Optional[List[str]] = None,
+        pointing_human_indices: Optional[List[List[int]]] = None,
         fingertip_direction_weight: float = 0.0,
         human_grasp_reference_indices: Optional[List[int]] = None,
         grasp_joint_names: Optional[List[str]] = None,
@@ -413,8 +418,9 @@ class DexPilotOptimizer(Optimizer):
         self.norm_delta = norm_delta
         self.finger_tip_link_names = finger_tip_link_names
         self.wrist_link_name = wrist_link_name
-        self.finger_tip_link_axes = finger_tip_link_axes
-        self.human_dip_indices = human_dip_indices
+        self.pointing_link_names = pointing_link_names
+        self.pointing_link_axes = pointing_link_axes
+        self.pointing_human_indices = pointing_human_indices
         self.fingertip_direction_weight = float(fingertip_direction_weight)
         self.human_grasp_reference_indices = human_grasp_reference_indices
         self.grasp_joint_names = grasp_joint_names
@@ -438,6 +444,10 @@ class DexPilotOptimizer(Optimizer):
         self.computed_link_names = list(
             set(target_origin_link_names).union(set(target_task_link_names))
         )
+        if self.pointing_link_names is not None:
+            self.computed_link_names = list(
+                set(self.computed_link_names).union(set(self.pointing_link_names))
+            )
         self.origin_link_indices = torch.tensor(
             [self.computed_link_names.index(name) for name in target_origin_link_names]
         )
@@ -448,18 +458,37 @@ class DexPilotOptimizer(Optimizer):
         self.finger_tip_computed_indices = [
             self.computed_link_names.index(name) for name in finger_tip_link_names
         ]
-        self.finger_tip_link_indices = self.get_link_indices(finger_tip_link_names)
-        if self.finger_tip_link_axes is not None:
-            if len(self.finger_tip_link_axes) != self.num_fingers:
+        if self.pointing_link_names is not None:
+            if (
+                self.pointing_link_axes is None
+                or self.pointing_human_indices is None
+            ):
                 raise ValueError(
-                    "finger_tip_link_axes length must match number of fingers"
+                    "DexPilot pointing_task requires pointing_link_names, pointing_link_axes and pointing_human_indices."
                 )
-            self.finger_tip_axis_local = np.stack(
-                [_axis_name_to_vector(name) for name in self.finger_tip_link_axes],
+            if len(self.pointing_link_names) != len(self.pointing_link_axes):
+                raise ValueError(
+                    "pointing_link_names and pointing_link_axes must have the same length"
+                )
+            if len(self.pointing_link_names) != len(self.pointing_human_indices):
+                raise ValueError(
+                    "pointing_link_names and pointing_human_indices must have the same length"
+                )
+            self.pointing_link_indices = self.get_link_indices(self.pointing_link_names)
+            self.pointing_link_computed_indices = [
+                self.computed_link_names.index(name) for name in self.pointing_link_names
+            ]
+            self.pointing_axis_local = np.stack(
+                [_axis_name_to_vector(name) for name in self.pointing_link_axes],
                 axis=0,
             )
+            self.pointing_human_indices = np.asarray(
+                self.pointing_human_indices, dtype=np.int64
+            )
         else:
-            self.finger_tip_axis_local = None
+            self.pointing_link_indices = None
+            self.pointing_link_computed_indices = None
+            self.pointing_axis_local = None
         if self.grasp_prior_weight > 0.0:
             if self.human_grasp_reference_indices is None:
                 raise ValueError(
@@ -578,12 +607,11 @@ class DexPilotOptimizer(Optimizer):
         raw_grasp_reference_points = None
         expected_tail_terms = 0
         if self.fingertip_direction_weight > 0.0:
-            if self.human_dip_indices is None or self.finger_tip_axis_local is None:
+            if self.pointing_human_indices is None or self.pointing_axis_local is None:
                 raise ValueError(
-                    "DexPilot fingertip direction loss requires both human_dip_indices "
-                    "and finger_tip_link_axes in config."
+                    "DexPilot pointing_task requires link_names, link_axes and human_indices in config."
                 )
-            expected_tail_terms += self.num_fingers
+            expected_tail_terms += len(self.pointing_link_names)
         if self.grasp_prior_weight > 0.0:
             expected_tail_terms += self.num_fingers - 1
         expected_shape = (len_proj + self.num_fingers + expected_tail_terms, 3)
@@ -601,11 +629,13 @@ class DexPilotOptimizer(Optimizer):
             )
         tail_start = len_proj + self.num_fingers
         if self.fingertip_direction_weight > 0.0:
-            direction_target = target_vector[tail_start : tail_start + self.num_fingers]
+            direction_target = target_vector[
+                tail_start : tail_start + len(self.pointing_link_names)
+            ]
             direction_target = direction_target / (
                 np.linalg.norm(direction_target, axis=1, keepdims=True) + 1e-6
             )
-            tail_start += self.num_fingers
+            tail_start += len(self.pointing_link_names)
         if self.grasp_prior_weight > 0.0:
             grasp_reference_points = target_vector[tail_start : tail_start + self.num_fingers - 1]
             tail_start += self.num_fingers - 1
@@ -711,18 +741,23 @@ class DexPilotOptimizer(Optimizer):
                 orientation_loss = 0.0
                 if grad.size > 0:
                     orientation_grad_qpos = np.zeros(self.opt_dof, dtype=np.float32)
-                for finger_id, tip_idx in enumerate(self.finger_tip_computed_indices):
-                    tip_pose = target_link_poses[tip_idx]
+                num_pointing_tasks = len(self.pointing_link_names)
+                for task_id, link_idx in enumerate(self.pointing_link_computed_indices):
+                    tip_pose = target_link_poses[link_idx]
                     tip_rot = tip_pose[:3, :3]
-                    axis_world = tip_rot @ self.finger_tip_axis_local[finger_id]
+                    axis_world = tip_rot @ self.pointing_axis_local[task_id]
                     axis_wrist = wrist_rot.T @ axis_world
                     axis_wrist = axis_wrist / (np.linalg.norm(axis_wrist) + 1e-6)
-                    target_axis = wrist_local_target[finger_id]
+                    target_axis = wrist_local_target[task_id]
                     cos_sim = float(np.clip(np.dot(axis_wrist, target_axis), -1.0, 1.0))
-                    orientation_loss += (1.0 - cos_sim) * self.fingertip_direction_weight / self.num_fingers
+                    orientation_loss += (
+                        (1.0 - cos_sim)
+                        * self.fingertip_direction_weight
+                        / num_pointing_tasks
+                    )
 
                     if grad.size > 0:
-                        tip_link_index = self.finger_tip_link_indices[finger_id]
+                        tip_link_index = self.pointing_link_indices[task_id]
                         tip_body_jacobian = self.robot.compute_single_link_local_jacobian(
                             qpos, tip_link_index
                         )[3:, ...]
@@ -744,7 +779,7 @@ class DexPilotOptimizer(Optimizer):
                         orientation_grad_qpos += (
                             -(target_axis @ axis_jacobian)
                             * self.fingertip_direction_weight
-                            / self.num_fingers
+                            / num_pointing_tasks
                         ).astype(np.float32)
                 result += orientation_loss
 

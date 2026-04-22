@@ -157,21 +157,27 @@ class RetargetingConfig:
     def _validate_pointing_task(self):
         if self.pointing_task is None:
             return
-        axes = self.pointing_task.get("finger_tip_link_axes")
-        dip_indices = self.pointing_task.get("human_dip_indices")
+        link_names = self.pointing_task.get("link_names")
+        axes = self.pointing_task.get("link_axes")
+        human_indices = self.pointing_task.get("human_indices")
         weight = float(self.pointing_task.get("weight", 0.0))
-        if axes is None or dip_indices is None:
+        if link_names is None or axes is None or human_indices is None:
             raise ValueError(
-                "DexPilot pointing_task requires finger_tip_link_axes and human_dip_indices"
+                "DexPilot pointing_task requires link_names, link_axes and human_indices"
             )
-        if len(axes) != len(self.finger_tip_link_names):
+        if len(link_names) != len(axes):
             raise ValueError(
-                "DexPilot pointing_task finger_tip_link_axes dim mismatch with finger_tip_link_names"
+                "DexPilot pointing_task link_names and link_axes dim mismatch"
             )
-        if len(dip_indices) != len(self.finger_tip_link_names):
+        if len(human_indices) != len(link_names):
             raise ValueError(
-                "DexPilot pointing_task human_dip_indices dim mismatch with finger_tip_link_names"
+                "DexPilot pointing_task human_indices dim mismatch with link_names"
             )
+        for pair in human_indices:
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise ValueError(
+                    "DexPilot pointing_task human_indices must be a list of [start, end] pairs"
+                )
         if weight <= 0.0:
             self.pointing_task = None
 
@@ -295,8 +301,9 @@ class RetargetingConfig:
                 joint_names,
                 finger_tip_link_names=self.finger_tip_link_names,
                 wrist_link_name=self.wrist_link_name,
-                finger_tip_link_axes=pointing_task.get("finger_tip_link_axes"),
-                human_dip_indices=pointing_task.get("human_dip_indices"),
+                pointing_link_names=pointing_task.get("link_names"),
+                pointing_link_axes=pointing_task.get("link_axes"),
+                pointing_human_indices=pointing_task.get("human_indices"),
                 fingertip_direction_weight=float(pointing_task.get("weight", 0.0)),
                 human_grasp_reference_indices=grasp_prior.get("human_reference_indices"),
                 grasp_joint_names=grasp_prior.get("joint_names"),
